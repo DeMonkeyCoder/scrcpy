@@ -465,8 +465,22 @@ execute_server(struct sc_server *server,
     //     Port: 5005
     // Then click on "Debug"
 #endif
-    // Inherit both stdout and stderr (all server logs are printed to stdout)
-    pid = sc_adb_execute(cmd, 0);
+    if(params->force_adb_forward) {
+        char full_cmd[4096] = {0};
+        for (unsigned i = 0; i < count - 1; ++i) {
+            strncat(full_cmd, cmd[i], sizeof(full_cmd) - strlen(full_cmd) - 1);
+            if (i < count - 1)
+                strncat(full_cmd, " ", sizeof(full_cmd) - strlen(full_cmd) - 1);
+        }
+        LOGI("Server launch command: %s", full_cmd);
+
+        printf("Run the server and press Enter to continue...\n");
+        getchar();
+        pid = 2;
+    } else {
+        // Inherit both stdout and stderr (all server logs are printed to stdout)
+        pid = sc_adb_execute(cmd, 0);
+    }
 
 end:
     for (unsigned i = dyn_idx; i < count; ++i) {
@@ -1081,9 +1095,11 @@ run_server(void *data) {
     assert(serial);
     LOGD("Device serial: %s", serial);
 
-    ok = push_server(&server->intr, serial);
-    if (!ok) {
-        goto error_connection_failed;
+    if (!params->force_adb_forward) {
+        ok = push_server(&server->intr, serial);
+        if (!ok) {
+            goto error_connection_failed;
+        }
     }
 
     // If --list-* is passed, then the server just prints the requested data
@@ -1128,23 +1144,28 @@ run_server(void *data) {
         .on_terminated = sc_server_on_terminated,
     };
     struct sc_process_observer observer;
-    ok = sc_process_observer_init(&observer, pid, &listener, server);
-    if (!ok) {
-        sc_process_terminate(pid);
-        sc_process_wait(pid, true); // ignore exit code
-        sc_adb_tunnel_close(&server->tunnel, &server->intr, serial,
-                            server->device_socket_name);
-        goto error_connection_failed;
+
+    if (!params->force_adb_forward) {
+        ok = sc_process_observer_init(&observer, pid, &listener, server);
+        if (!ok) {
+            sc_process_terminate(pid);
+            sc_process_wait(pid, true); // ignore exit code
+            sc_adb_tunnel_close(&server->tunnel, &server->intr, serial,
+                                server->device_socket_name);
+            goto error_connection_failed;
+        }
     }
 
     ok = sc_server_connect_to(server, &server->info);
-    // The tunnel is always closed by server_connect_to()
-    if (!ok) {
-        sc_process_terminate(pid);
-        sc_process_wait(pid, true); // ignore exit code
-        sc_process_observer_join(&observer);
-        sc_process_observer_destroy(&observer);
-        goto error_connection_failed;
+    if (!params->force_adb_forward) {
+        // The tunnel is always closed by server_connect_to()
+        if (!ok) {
+            sc_process_terminate(pid);
+            sc_process_wait(pid, true); // ignore exit code
+            sc_process_observer_join(&observer);
+            sc_process_observer_destroy(&observer);
+            goto error_connection_failed;
+        }
     }
 
     // Now connected
@@ -1179,26 +1200,29 @@ run_server(void *data) {
         net_interrupt(server->client_mic_socket);
     }
 
+    
     // Give some delay for the server to terminate properly
 #define WATCHDOG_DELAY SC_TICK_FROM_SEC(1)
-    sc_tick deadline = sc_tick_now() + WATCHDOG_DELAY;
-    bool terminated = sc_process_observer_timedwait(&observer, deadline);
+    if (!params->force_adb_forward) {
+        sc_tick deadline = sc_tick_now() + WATCHDOG_DELAY;
+        bool terminated = sc_process_observer_timedwait(&observer, deadline);
 
-    // After this delay, kill the server if it's not dead already.
-    // On some devices, closing the sockets is not sufficient to wake up the
-    // blocking calls while the device is asleep.
-    if (!terminated) {
-        // The process may have terminated since the check, but it is not
-        // reaped (closed) yet, so its PID is still valid, and it is ok to call
-        // sc_process_terminate() even in that case.
-        LOGW("Killing the server...");
-        sc_process_terminate(pid);
+        // After this delay, kill the server if it's not dead already.
+        // On some devices, closing the sockets is not sufficient to wake up the
+        // blocking calls while the device is asleep.
+        if (!terminated) {
+            // The process may have terminated since the check, but it is not
+            // reaped (closed) yet, so its PID is still valid, and it is ok to call
+            // sc_process_terminate() even in that case.
+            LOGW("Killing the server...");
+            sc_process_terminate(pid);
+        }
+
+        sc_process_observer_join(&observer);
+        sc_process_observer_destroy(&observer);
+
+        sc_process_close(pid);
     }
-
-    sc_process_observer_join(&observer);
-    sc_process_observer_destroy(&observer);
-
-    sc_process_close(pid);
 
     sc_server_kill_adb_if_requested(server);
 
